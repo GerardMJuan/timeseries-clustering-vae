@@ -4,3 +4,9 @@
 \.ipynb_checkpoints/
 
 vrae/__pycache__/
+
+environment.txt
+data/*.csv
+*png
+data/ECG5000/ECG5000_TEST
+data/ECG5000/ECG5000_TRAIN

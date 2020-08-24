@@ -27,6 +27,7 @@ class Encoder(nn.Module):
         self.hidden_size = hidden_size
         self.hidden_layer_depth = hidden_layer_depth
         self.latent_length = latent_length
+        self.block = block
 
         if block == 'LSTM':
             self.model = nn.LSTM(self.number_of_features, self.hidden_size, self.hidden_layer_depth, dropout = dropout)
@@ -41,8 +42,12 @@ class Encoder(nn.Module):
         :param x: input to the encoder, of shape (sequence_length, batch_size, number_of_features)
         :return: last hidden state of encoder, of shape (batch_size, hidden_size)
         """
-
-        _, (h_end, c_end) = self.model(x)
+        if self.block == 'LSTM':
+            _, (h_end, c_end) = self.model(x)
+        elif self.block == 'GRU':
+            _, h_end = self.model(x)
+        else:
+            raise NotImplementedError
 
         h_end = h_end[-1, :, :]
         return h_end
@@ -95,12 +100,11 @@ class Decoder(nn.Module):
     :param block: GRU/LSTM - use the same which you've used in the encoder
     :param dtype: Depending on cuda enabled/disabled, create the tensor
     """
-    def __init__(self, sequence_length, batch_size, hidden_size, hidden_layer_depth, latent_length, output_size, dtype, block='LSTM'):
+    def __init__(self, sequence_length, hidden_size, hidden_layer_depth, latent_length, output_size, dtype, block='LSTM'):
 
         super(Decoder, self).__init__()
 
         self.hidden_size = hidden_size
-        self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.hidden_layer_depth = hidden_layer_depth
         self.latent_length = latent_length
@@ -117,19 +121,23 @@ class Decoder(nn.Module):
         self.latent_to_hidden = nn.Linear(self.latent_length, self.hidden_size)
         self.hidden_to_output = nn.Linear(self.hidden_size, self.output_size)
 
-        self.decoder_inputs = torch.zeros(self.sequence_length, self.batch_size, 1, requires_grad=True).type(self.dtype)
-        self.c_0 = torch.zeros(self.hidden_layer_depth, self.batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
-
         nn.init.xavier_uniform_(self.latent_to_hidden.weight)
         nn.init.xavier_uniform_(self.hidden_to_output.weight)
 
-    def forward(self, latent):
+    def forward(self, latent, batch_size):
         """Converts latent to hidden to output
 
         :param latent: latent vector
         :return: outputs consisting of mean and std dev of vector
         """
         h_state = self.latent_to_hidden(latent)
+
+        # Because it uses the latent vector as the h_state?
+        # So, it actually starts with zeros and then gets the output?
+        # And from the output, it reconstructs the final sequence. So it is not really a seq2seq
+
+        self.decoder_inputs = torch.zeros(self.sequence_length, batch_size, 1, requires_grad=True).type(self.dtype)
+        self.c_0 = torch.zeros(self.hidden_layer_depth, batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
 
         if isinstance(self.model, nn.LSTM):
             h_0 = torch.stack([h_state for _ in range(self.hidden_layer_depth)])
@@ -199,7 +207,6 @@ class VRAE(BaseEstimator, nn.Module):
                            latent_length=latent_length)
 
         self.decoder = Decoder(sequence_length=sequence_length,
-                               batch_size = batch_size,
                                hidden_size=hidden_size,
                                hidden_layer_depth=hidden_layer_depth,
                                latent_length=latent_length,
@@ -220,6 +227,8 @@ class VRAE(BaseEstimator, nn.Module):
         self.max_grad_norm = max_grad_norm
         self.is_fitted = False
         self.dload = dload
+
+        self.training_loss = None
 
         if self.use_cuda:
             self.cuda()
@@ -251,7 +260,7 @@ class VRAE(BaseEstimator, nn.Module):
         """
         cell_output = self.encoder(x)
         latent = self.lmbd(cell_output)
-        x_decoded = self.decoder(latent)
+        x_decoded = self.decoder(latent, x.shape[1])
 
         return x_decoded, latent
 
@@ -292,12 +301,11 @@ class VRAE(BaseEstimator, nn.Module):
         For each epoch, given the batch_size, run this function batch_size * num_of_batches number of times
 
         :param train_loader:input train loader with shuffle
-        :return:
+        :return: returns the average loss
         """
         self.train()
 
         epoch_loss = 0
-        t = 0
 
         for t, X in enumerate(train_loader):
 
@@ -305,6 +313,7 @@ class VRAE(BaseEstimator, nn.Module):
             X = X[0]
 
             # required to swap axes, since dataloader gives output in (batch_size x seq_len x num_of_features)
+            #Now we know
             X = X.permute(1,0,2)
 
             self.optimizer.zero_grad()
@@ -319,11 +328,11 @@ class VRAE(BaseEstimator, nn.Module):
 
             self.optimizer.step()
 
-            if (t + 1) % self.print_every == 0:
-                print('Batch %d, loss = %.4f, recon_loss = %.4f, kl_loss = %.4f' % (t + 1, loss.item(),
+            if (self.t + 1) % self.print_every == 0:
+                print('Epoch %d, loss = %.4f, recon_loss = %.4f, kl_loss = %.4f' % (self.t + 1, loss.item(),
                                                                                     recon_loss.item(), kl_loss.item()))
-
-        print('Average loss: {:.4f}'.format(epoch_loss / t))
+                print('Average loss: {:.4f}'.format(epoch_loss))
+        return epoch_loss/(t+1.0)
 
 
     def fit(self, dataset, save = False):
@@ -338,13 +347,13 @@ class VRAE(BaseEstimator, nn.Module):
         train_loader = DataLoader(dataset = dataset,
                                   batch_size = self.batch_size,
                                   shuffle = True,
-                                  drop_last=True)
-
+                                  drop_last=False)
+        self.training_loss = []
+        self.t = 0
         for i in range(self.n_epochs):
-            print('Epoch: %s' % i)
-
-            self._train(train_loader)
-
+            curr_loss = self._train(train_loader)
+            self.training_loss.append(curr_loss)
+            self.t += 1
         self.is_fitted = True
         if save:
             self.save('model.pth')
@@ -391,7 +400,7 @@ class VRAE(BaseEstimator, nn.Module):
         test_loader = DataLoader(dataset = dataset,
                                  batch_size = self.batch_size,
                                  shuffle = False,
-                                 drop_last=True) # Don't shuffle for test_loader
+                                 drop_last=False) 
 
         if self.is_fitted:
             with torch.no_grad():
@@ -400,10 +409,8 @@ class VRAE(BaseEstimator, nn.Module):
                 for t, x in enumerate(test_loader):
                     x = x[0]
                     x = x.permute(1, 0, 2)
-
                     x_decoded_each = self._batch_reconstruct(x)
                     x_decoded.append(x_decoded_each)
-
                 x_decoded = np.concatenate(x_decoded, axis=1)
 
                 if save:
@@ -431,7 +438,7 @@ class VRAE(BaseEstimator, nn.Module):
         test_loader = DataLoader(dataset = dataset,
                                  batch_size = self.batch_size,
                                  shuffle = False,
-                                 drop_last=True) # Don't shuffle for test_loader
+                                 drop_last=False) # Don't shuffle for test_loader
         if self.is_fitted:
             with torch.no_grad():
                 z_run = []
@@ -439,7 +446,6 @@ class VRAE(BaseEstimator, nn.Module):
                 for t, x in enumerate(test_loader):
                     x = x[0]
                     x = x.permute(1, 0, 2)
-
                     z_run_each = self._batch_transform(x)
                     z_run.append(z_run_each)
 
