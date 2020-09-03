@@ -6,13 +6,11 @@ Easier for me to run this and debug it, jupyter from hpc is messy.
 Leave jupyter notebooks for generating 
 """
 
-from vrae.vrae import VRAE
-from vrae.utils import open_MRI_data
+from vrae.vrae2 import VRAE
+from vrae.utils import open_MRI_data, open_MRI_data_var
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 
-from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import mean_absolute_error
 
 ### Parameters
@@ -34,25 +32,22 @@ dload = './mri_model_dir' #download directory
 
 # LOAD DATA
 csv_path = "data/tadpole_mrionly.csv"
-X_train, X_val = open_MRI_data(csv_path, train_set=0.8, n_followups=5, normalize=True)
+X_train, X_val = open_MRI_data_var(csv_path, train_set=0.8, normalize=True)
+print(len(X_train))
+print(X_train[0].shape)
+print(X_train[1].shape)
+number_of_features = X_train[0].shape[1]
+print(number_of_features)
 
-sequence_length = X_train.shape[1]
-number_of_features = X_train.shape[2]
-
-#We define batch size as the full length
-# To change this we would need to change structurally everything. Afternoon.
-# batch_size = X_train.shape[0] #In our original paper, there is no batch size, all the optimization is done together
 batch_size = len(X_train)
 
-#Convert to torch
-#Why use TENSORDATASET? In theory, no need to use it
-train_dataset = TensorDataset(torch.from_numpy(X_train))
-test_dataset = TensorDataset(torch.from_numpy(X_val))
+#Convert to torch (should we do it?)
+# train_dataset = TensorDataset(torch.from_numpy(X_train))
+# test_data = torch.from_numpy(X_val)
 
 #We would like the batch size 
 # initiate VRAE and fit
-vrae = VRAE(sequence_length=sequence_length,
-            number_of_features = number_of_features,
+vrae = VRAE(number_of_features = number_of_features,
             hidden_size = hidden_size, 
             hidden_layer_depth = hidden_layer_depth,
             latent_length = latent_length,
@@ -70,7 +65,7 @@ vrae = VRAE(sequence_length=sequence_length,
             dload = dload)
 
 # Fit the model
-vrae.fit(train_dataset)
+vrae.fit(X_train)
 
 print(vrae.encoder)
 print(vrae.lmbd)
@@ -93,8 +88,8 @@ plt.title("Loss function")
 plt.savefig(dload + 'loss.png')
 plt.close()
 # Transform the test dataset
-X_hat_train = vrae.reconstruct(train_dataset)
-X_hat = vrae.reconstruct(test_dataset)
+X_hat_train = vrae.reconstruct(X_train)
+X_hat = vrae.reconstruct(X_test)
 
 # Need to reshape
 X_hat = np.swapaxes(X_hat,0,1)

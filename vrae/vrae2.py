@@ -11,9 +11,48 @@ from torch import distributions
 from .base import BaseEstimator
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
-from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, PackedSequence
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, PackedSequence, pad_packed_sequence
 import os
 
+## Decidint on device on device.
+DEVICE_ID = 0
+DEVICE = torch.device('cuda:' + str(DEVICE_ID) if torch.cuda.is_available() else 'cpu')
+if torch.cuda.is_available():
+	torch.cuda.set_device(DEVICE_ID)
+
+
+def collate_fn_padd(batch):
+    '''
+    Padds batch of variable length
+
+    note: it converts things ToTensor manually here since the ToTensor transform
+    assume it takes in images rather than arbitrary tensors.
+    '''
+    ## get sequence lengths
+    #Sort the data
+    batch = sorted(batch, key=len, reverse=True)
+
+    lengths = torch.tensor([ t.shape[0] for t in batch ])
+    ## padd
+    batch = [ torch.FloatTensor(t) for t in batch ]
+    batch = torch.nn.utils.rnn.pad_sequence(batch)
+    return batch.to(device=DEVICE_ID), lengths.to(device=DEVICE_ID)
+
+def pack_sequence(X, pad=True, lengths=None):
+    """
+    Function to pack a batch of different sequence length.
+    """
+    if pad:
+        # Sort the data by sequence length
+        X = sorted(X, key=len, reverse=True)
+        # Pad the sequence
+        #and get length of the sequence
+        lengths = [len(x) for x in X]
+        X = pad_sequence(X) 
+    # Pack the sequence
+    X = pack_padded_sequence(X, lengths)
+    # Update lengths
+    return (X, lengths)
 
 class Encoder(nn.Module):
     """
@@ -43,16 +82,20 @@ class Encoder(nn.Module):
         else:
             raise NotImplementedError
 
-    def forward(self, x):
+    def forward(self, x, lengths):
         """Forward propagation of encoder. Given input, outputs the last hidden state of encoder
 
         :param x: input to the encoder, of shape (sequence_length, batch_size, number_of_features)
         :return: last hidden state of encoder, of shape (batch_size, hidden_size)
         """
+
+        x_packed = pack_padded_sequence(x, lengths)
+
+
         if self.block == 'LSTM':
-            _, (h_end, c_end) = self.model(x)
+            _, (h_end, c_end) = self.model(x_packed)
         elif self.block == 'GRU':
-            _, h_end = self.model(x)
+            _, h_end = self.model(x_packed)
         else:
             raise NotImplementedError
 
@@ -109,12 +152,12 @@ class Decoder(nn.Module):
     :param block: GRU/LSTM - use the same which you've used in the encoder
     :param dtype: Depending on cuda enabled/disabled, create the tensor
     """
-    def __init__(self, sequence_length, hidden_size, hidden_layer_depth, latent_length, output_size, dtype, block='LSTM'):
+    def __init__(self, batch_size, hidden_size, hidden_layer_depth, latent_length, output_size, dtype, block='LSTM'):
 
         super(Decoder, self).__init__()
 
+        self.batch_size = batch_size
         self.hidden_size = hidden_size
-        self.sequence_length = sequence_length
         self.hidden_layer_depth = hidden_layer_depth
         self.latent_length = latent_length
         self.output_size = output_size
@@ -133,22 +176,21 @@ class Decoder(nn.Module):
         nn.init.xavier_uniform_(self.latent_to_hidden.weight)
         nn.init.xavier_uniform_(self.hidden_to_output.weight)
 
-    def forward(self, latent, batch_size):
+    def forward(self, latent, lengths):
         """Converts latent to hidden to output
 
         :param latent: latent vector
         :return: outputs consisting of mean and std dev of vector
         """
         h_state = self.latent_to_hidden(latent)
-
-        # Because it uses the latent vector as the h_state?
-        # So, it actually starts with zeros and then gets the output?
-        # And from the output, it reconstructs the final sequence. So it is not really a seq2seq
-
-        self.decoder_inputs = torch.zeros(self.sequence_length, batch_size, 1, requires_grad=True).type(self.dtype)
+        #How to create the inputs of the decoder? With a variable sequence length?
+        # We have the length and the batch size
+        max_length = torch.max(lengths) # get the max length
+        padded_inputs = torch.zeros(max_length, self.batch_size, 1, requires_grad=True).type(self.dtype)
+        self.decoder_inputs = pack_padded_sequence(padded_inputs, lengths)
         
         # Only needed when using LSTM
-        self.c_0 = torch.zeros(self.hidden_layer_depth, batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
+        self.c_0 = torch.zeros(self.hidden_layer_depth, self.batch_size, self.hidden_size, requires_grad=True).type(self.dtype)
 
         if isinstance(self.model, nn.LSTM):
             h_0 = torch.stack([h_state for _ in range(self.hidden_layer_depth)])
@@ -158,10 +200,13 @@ class Decoder(nn.Module):
             decoder_output, _ = self.model(self.decoder_inputs, h_0)
         else:
             raise NotImplementedError
+        
+        # Unppack
+        decoder_unpacked, lens_unpacked = pad_packed_sequence(decoder_output)
 
         #This implements a linear layer between the output of the lstm and the final shape
         # here could introduce a breakpoint to check the sizes of everything
-        out = self.hidden_to_output(decoder_output)
+        out = self.hidden_to_output(decoder_unpacked)
         return out
 
 
@@ -173,8 +218,6 @@ def _assert_no_grad(tensor):
 """
 Main changes w.r.t. previous version:
 * It uses paddedsequences. This should be done in a separate function, after feeding the data.
-* The batch size is no longer linked to the dataset. TODO: no need to remove this
-* Removed the use of tensordataset
 Check this when debugging:
 https://pytorch.org/docs/stable/generated/torch.nn.utils.rnn.PackedSequence.html#torch.nn.utils.rnn.PackedSequence
 """
@@ -200,7 +243,7 @@ class VRAE(BaseEstimator, nn.Module):
     :param max_grad_norm: The grad-norm to be clipped
     :param dload: Download directory where models are to be dumped
     """
-    def __init__(self, sequence_length, number_of_features, hidden_size=90, hidden_layer_depth=2, latent_length=20,
+    def __init__(self, number_of_features, hidden_size=90, hidden_layer_depth=2, latent_length=20,
                  batch_size=32, learning_rate=0.005, block='LSTM',
                  n_epochs=5, dropout_rate=0., optimizer='Adam', loss='MSELoss',
                  cuda=False, print_every=100, clip=True, max_grad_norm=5, dload='.'):
@@ -229,7 +272,7 @@ class VRAE(BaseEstimator, nn.Module):
         self.lmbd = Lambda(hidden_size=hidden_size,
                            latent_length=latent_length)
 
-        self.decoder = Decoder(sequence_length=sequence_length,
+        self.decoder = Decoder(batch_size = batch_size,
                                hidden_size=hidden_size,
                                hidden_layer_depth=hidden_layer_depth,
                                latent_length=latent_length,
@@ -237,7 +280,6 @@ class VRAE(BaseEstimator, nn.Module):
                                block=block,
                                dtype=self.dtype)
 
-        self.sequence_length = sequence_length
         self.hidden_size = hidden_size
         self.hidden_layer_depth = hidden_layer_depth
         self.latent_length = latent_length
@@ -250,6 +292,9 @@ class VRAE(BaseEstimator, nn.Module):
         self.max_grad_norm = max_grad_norm
         self.is_fitted = False
         self.dload = dload
+
+        # lengths of the current packedsequence, to use in the decoder
+        self.lengths = None
 
         #self.training_loss = None
 
@@ -283,11 +328,10 @@ class VRAE(BaseEstimator, nn.Module):
         :param x:input tensor
         :return: the decoded output, latent vector
         """
-        cell_output = self.encoder(x)
+        cell_output = self.encoder(x, self.lengths)
         latent = self.lmbd(cell_output)
         #Pass as input the shape of the original data, which will be equivalent to the batch size
-        x_decoded = self.decoder(latent, x.shape[1])
-
+        x_decoded = self.decoder(latent, self.lengths)
         return x_decoded, latent
 
     def _rec(self, x_decoded, x, loss_fn):
@@ -314,37 +358,34 @@ class VRAE(BaseEstimator, nn.Module):
         :param X: Input tensor
         :return: total loss, reconstruction loss, kl-divergence loss and original input
         """
-        x = Variable(X[:,:,:].type(self.dtype), requires_grad = True)
+        # x = Variable(X[:,:,:].type(self.dtype), requires_grad = True)
 
-        x_decoded, _ = self(x)
-        loss, recon_loss, kl_loss = self._rec(x_decoded, x.detach(), self.loss_fn)
+        x_decoded, _ = self(X)
+        loss, recon_loss, kl_loss = self._rec(x_decoded, X, self.loss_fn)
+        losses = {'total': loss,
+                  'kl': kl_loss,
+                  'll': recon_loss}
 
-		losses = {
-			'total': loss,
-			'kl': kl_loss,
-			'll': recon_loss
-		}
+        if self.training:
+            self.save_loss(losses)
+            return loss
+        else:
+            return losses
 
-		if self.training:
-			self.save_loss(losses)
-			return loss
-		else:
-			return losses
+    def save_loss(self, losses):
+        for key in self.loss.keys():
+            self.loss[key].append(float(losses[key].detach().item()))
 
-	def save_loss(self, losses):
-		for key in self.loss.keys():
-			self.loss[key].append(float(losses[key].detach().item()))
-
-	def init_loss(self):
-		empty_loss = {
-			'total': [],
-			'kl': [],
-			'll': []
-		}
-		self.loss = empty_loss
+    def init_loss(self):
+        empty_loss = {
+            'total': [],
+            'kl': [],
+            'll': []
+        }
+        self.loss = empty_loss
 
 
-    def _train(self, data):
+    def _train(self, X):
         """
         For each epoch run this function batch_size * num_of_batches number of times
 
@@ -367,59 +408,50 @@ class VRAE(BaseEstimator, nn.Module):
 
         return loss
 
-
-    def fit(self, data, save = False):
+    def fit(self, dataset, save = False):
         """
         Calls `_train` function over a fixed number of epochs, specified by `n_epochs`
-
+        : dataset: a TensorDataset
         :param data: list of sequences of variable length, list[Tensor], or a PackedSequence object
-        NOTE: we assume that the sequences are sorted, from longest to shortest
-        NOTE: maybe we need to do some kind of shuffle? (maybe that was the reason of the dataloader imo)
-        NOTE: are we sure that not having a batch size is the way to go? should combine DataLoader With Packedsequence
         https://discuss.pytorch.org/t/packedsequence-with-dataloader/1495
         :param bool save: If true, dumps the trained model parameters as pickle file at `dload` directory
         :return:
         """
         
-        # Check if the data is a padded sequence. If not, pad it
-        if not isinstance(data, PackedSequence):
-            data = pack_sequence(X)
+        train_loader = DataLoader(dataset = dataset,
+                                  batch_size = self.batch_size,
+                                  shuffle = True,
+                                  drop_last = True,
+                                  collate_fn = collate_fn_padd)
 
-        t = 0
         for i in range(self.n_epochs):
-            loss = self._train(data)
-
+            t = 0
+            #For each epoch ,run the train loader
+            for t, (X, lengths) in enumerate(train_loader):
+                #Get 
+                self.lengths = lengths
+                # Convert to packetsequence
+                # data, _ = pack_sequence(X, False, self.lengths)
+                # Run
+                loss = self._train(X)
+                loss = loss.detach().cpu()
             #Check if nan
             if np.isnan(loss):
-				print('Loss is nan!')
-				break
+                print('Loss is nan!')
+                break
 
-            if (t) % self.print_every == 0:
-                print('Epoch %d, loss = %.4f, recon_loss = %.4f, kl_loss = %.4f' % (self.t, loss['total'][t](),
-                                                                                    loss['ll'][t], loss['kl'][t]))
-                print('Average loss: {:.4f}'.format(epoch_loss))
-            t += 1
+            if i % self.print_every == 0:
+                print('Epoch %d, loss = %.4f, recon_loss = %.4f, kl_loss = %.4f' % (i, self.loss['total'][i],
+                                                                                    self.loss['ll'][i], self.loss['kl'][i]))
+                print('Average loss: {:.4f}'.format(loss))
             
         self.is_fitted = True
 
         if save:
             self.save('model.pth')
 
-		self.eval()  # Inherited method which sets self.training = False
+        self.eval()  # Inherited method which sets self.training = False
 
-    def pack_sequence(X):
-        """
-        Function to pack a batch of different sequence length.
-        """
-        # Sort the data by sequence length
-        X = sorted(X, key=len, reverse=True)
-        # Pad the sequence
-        #and get length of the sequence
-        lengths = [len(x) for x in X]
-        X = pad_sequence(X) 
-        # Pack the sequence
-        X = pack_padded_sequence(X, lengths)
-        return X
 
 
     def _batch_transform(self, x):
@@ -462,7 +494,7 @@ class VRAE(BaseEstimator, nn.Module):
 
         # Check if the data is a padded sequence. If not, pad it
         if not isinstance(data, PackedSequence):
-            data = pack_sequence(X)
+            data, self.lengths = pack_sequence(data)
 
 
         if self.is_fitted:
@@ -470,7 +502,7 @@ class VRAE(BaseEstimator, nn.Module):
                 x_decoded = []
                 # x = x[0]
                 # x = x.permute(1, 0, 2)
-                x_decoded = self._batch_reconstruct(x)
+                x_decoded = self._batch_reconstruct(data)
 
                 if save:
                     if os.path.exists(self.dload):
@@ -496,7 +528,7 @@ class VRAE(BaseEstimator, nn.Module):
 
         # Check if the data is a padded sequence. If not, pad it
         if not isinstance(data, PackedSequence):
-            data = pack_sequence(X)
+            data, self.lengths = pack_sequence(data)
 
 
         if self.is_fitted:
@@ -505,7 +537,7 @@ class VRAE(BaseEstimator, nn.Module):
 
                 #x = x[0]
                 #x = x.permute(1, 0, 2)
-                z_run = self._batch_transform(x)
+                z_run = self._batch_transform(data)
                 if save:
                     if os.path.exists(self.dload):
                         pass
@@ -550,3 +582,17 @@ class VRAE(BaseEstimator, nn.Module):
         """
         self.is_fitted = True
         self.load_state_dict(torch.load(PATH))
+
+
+
+
+class VRAE_seq(VRAE):
+
+    def __init__(self, number_of_features, hidden_size=90, hidden_layer_depth=2, latent_length=20,
+                 batch_size=32, learning_rate=0.005, block='LSTM',
+                 n_epochs=5, dropout_rate=0., optimizer='Adam', loss='MSELoss',
+                 cuda=False, print_every=100, clip=True, max_grad_norm=5, dload='.'):
+
+        super(VRAE, self).__init__()
+
+

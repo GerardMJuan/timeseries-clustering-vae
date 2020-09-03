@@ -6,9 +6,6 @@ import os
 import matplotlib.pyplot as plt
 import pandas as pd
 
-#from plotly.graph_objs import *
-#import plotly
-
 
 def plot_clustering(z_run, labels, engine ='plotly', download = False, folder_name ='clustering'):
     """
@@ -152,6 +149,33 @@ def pandas_to_data_timeseries(df, feat, n_timesteps = 5, id_col = 'PTID', time='
     # Return numpy dataframe
     return X
 
+def pandas_to_data_timeseries_var(df, feat, id_col = 'PTID', time='VISCODE'):
+    """
+    Quick function that converts a pandas dataframe with the features
+    indicated by a vector "feat" (with the name of the features columns) and "id_col"
+    indicating the column of the subject ids, and column time to order them by time.
+
+    The number of rows is variable, so we are creating a list of numpy arrays
+    """
+    # Order the dataframe
+    df = df.sort_values(by=[id_col, time], ascending=False)
+
+    #Nuumber of samples
+    sample_list = np.unique(df[id_col])
+
+    # Create base list
+    X = []
+    # Iterate over each subject and fill it
+    df_feats = df.loc[:, feat]
+    i = 0
+    for ptid in sample_list:
+        i_list = df.index[df['PTID'] == ptid]
+        feats = df_feats.iloc[i_list, :].values
+        X.append(feats)
+        i += 1
+
+    # Return numpy dataframe
+    return X
 
 def open_MRI_data(csv_path, train_set = 0.8, n_followups=5, normalize=True):
     """
@@ -204,6 +228,46 @@ def open_MRI_data(csv_path, train_set = 0.8, n_followups=5, normalize=True):
     # Return the features in the correct shape (Nsamples, timesteps, nfeatures)
     X_train = pandas_to_data_timeseries(df_train, mri_col)
     X_test = pandas_to_data_timeseries(df_test, mri_col)
+
+    return X_train, X_test
+
+
+def open_MRI_data_var(csv_path, train_set = 0.8, normalize=True):
+    """
+    Function to return a variable number of followups from a dataset
+
+    Returns:
+    X_test: list composed of tensors of variable length
+    X_train: list composed of tensors of variable length
+    """
+    data_df = pd.read_csv(csv_path)
+
+    mri_col = data_df.columns.str.contains("SV_UCSFFSX_11_02_15_UCSFFSX51_08_01_16")
+    mri_col = data_df.columns[mri_col].values
+
+    data_df = data_df.dropna(axis=0, subset=mri_col)
+
+    # Select only the subjects with nfollowups
+    # Code to only select 5 first appearances of each PTID
+    ptid_list = np.unique(data_df["PTID"])
+
+    idx_to_drop = []
+    data_final = data_df.drop(idx_to_drop)
+
+    # Divide between test and train
+    from sklearn.model_selection import GroupShuffleSplit
+    gss = GroupShuffleSplit(n_splits=1, test_size=1.0-train_set)
+    train_dataset, test_dataset = next(gss.split(X=data_final, y=data_final.DX_bl.values, groups=data_final.PTID.values))
+
+    df_train = data_final.iloc[train_dataset]
+    df_test =  data_final.iloc[test_dataset]
+
+    df_train = df_train.reset_index(drop=True)
+    df_test = df_test.reset_index(drop=True)
+
+    # Return the features in the correct shape list of Tensors (timesteps, nfeatures)
+    X_train = pandas_to_data_timeseries_var(df_train, mri_col)
+    X_test = pandas_to_data_timeseries_var(df_test, mri_col)
 
     return X_train, X_test
 
